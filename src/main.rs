@@ -1,99 +1,63 @@
-use std::{io, net, str::FromStr};
+use std::ops::Bound::Included;
+use std::{collections::BTreeMap, convert::TryInto, io, net, str::FromStr};
 
 use actix::{prelude::*, spawn};
-use bytes::BytesMut;
-use serde::{Deserialize, Serialize};
-use serde_json::Number;
+use bytes::{BytesMut, BufMut};
 use tokio::{
     io::{split, WriteHalf},
     net::{TcpListener, TcpStream},
 };
-use tokio_util::codec::{BytesCodec, FramedRead, LinesCodec, LinesCodecError};
+use tokio_util::codec::{Decoder, Encoder, FramedRead};
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Request {
-    method: String,
-    number: Number,
+enum Request {
+    Insert { time: i32, pennies: i32 },
+    Query { mintime: i32, maxtime: i32 },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Response {
-    method: String,
-    prime: bool,
-}
+type Response = i32;
 
 struct PrimeCheckSession {
-    framed: actix::io::FramedWrite<BytesMut, WriteHalf<TcpStream>, BytesCodec>,
+    data: BTreeMap<i32, i32>,
+    framed: actix::io::FramedWrite<Response, WriteHalf<TcpStream>, AnswerEncoder>,
 }
 
 impl Actor for PrimeCheckSession {
     type Context = Context<Self>;
 
-    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
+    fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
         println!("Connection stopping...");
         Running::Stop
     }
 
-    fn stopped(&mut self, ctx: &mut Self::Context) {
+    fn stopped(&mut self, _ctx: &mut Self::Context) {
         println!("Connection stopped...");
     }
 }
 
-fn is_prime(num: i64) -> bool {
-    if num < 2 {
-        return false;
-    }
-
-    let mut check = 2;
-    while check * check <= num {
-        if num % check == 0 {
-            return false;
-        }
-        check += 1;
-    }
-    return true;
-}
-
-impl StreamHandler<Result<String, LinesCodecError>> for PrimeCheckSession {
-    fn finished(&mut self, ctx: &mut Self::Context) {
+impl StreamHandler<Result<Request, io::Error>> for PrimeCheckSession {
+    fn finished(&mut self, _ctx: &mut Self::Context) {
         self.framed.close();
     }
 
-    fn handle(&mut self, item: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
+    fn handle(&mut self, item: Result<Request, io::Error>, ctx: &mut Self::Context) {
         match item {
-            Ok(str) => {
-                println!("Received request: {:?}", str);
-                let decoded: Request = match serde_json::from_str(&str) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        println!("Err: {}", e);
-                        self.framed.write(BytesMut::from("invalid json"));
-                        ctx.stop();
-                        return;
-                    }
-                };
-                if decoded.method != "isPrime" {
-                    self.framed.write(BytesMut::from("invalid method"));
-                    ctx.stop();
+            Ok(Request::Insert { time, pennies }) => {
+                println!("Insert at {} value {}", time, pennies);
+                self.data.insert(time, pennies);
+            }
+            Ok(Request::Query { mintime, maxtime }) => {
+                println!("Query from {} to {}", mintime, maxtime);
+                if mintime > maxtime {
+                    self.framed.write(0);
                     return;
                 }
-                println!("Received json: {:?}", decoded);
-
-                let prime = if let Some(num) = decoded.number.as_i64() {
-                    is_prime(num)
-                } else {
-                    false
-                };
-
-                self.framed.write(BytesMut::from(
-                    serde_json::to_string(&Response {
-                        method: "isPrime".to_owned(),
-                        prime,
-                    })
-                    .unwrap()
-                    .as_str(),
-                ));
-                self.framed.write(BytesMut::from("\n"));
+                let mut sum: i64 = 0;
+                let mut items = 0;
+                for (_, value) in self.data.range((Included(mintime), Included(maxtime))) {
+                    sum += *value as i64;
+                    items += 1;
+                }
+                self.framed.write(sum.checked_div(items).unwrap_or(0).try_into().unwrap_or(0));
             }
             Err(e) => {
                 println!("IO Error: {}", e);
@@ -107,9 +71,54 @@ impl actix::io::WriteHandler<io::Error> for PrimeCheckSession {}
 
 impl PrimeCheckSession {
     fn new(
-        framed: actix::io::FramedWrite<BytesMut, WriteHalf<TcpStream>, BytesCodec>,
+        framed: actix::io::FramedWrite<Response, WriteHalf<TcpStream>, AnswerEncoder>,
     ) -> PrimeCheckSession {
-        PrimeCheckSession { framed }
+        PrimeCheckSession {
+            framed,
+            data: BTreeMap::new(),
+        }
+    }
+}
+
+struct NineBytesDecoder;
+
+impl Decoder for NineBytesDecoder {
+    type Item = Request;
+
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 9 {
+            return Ok(None);
+        }
+        let bytes = src.split_to(9);
+
+        let first = i32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        let second = i32::from_be_bytes(bytes[5..9].try_into().unwrap());
+        if bytes[0] == b'I' {
+            Ok(Some(Request::Insert {
+                time: first,
+                pennies: second,
+            }))
+        } else if bytes[0] == b'Q' {
+            Ok(Some(Request::Query {
+                mintime: first,
+                maxtime: second,
+            }))
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "invalid message type"))
+        }
+    }
+}
+
+struct AnswerEncoder;
+
+impl Encoder<Response> for AnswerEncoder {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: Response, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.put(&i32::to_be_bytes(item)[..]);
+        Ok(())
     }
 }
 
@@ -125,10 +134,9 @@ pub fn tcp_server(s: &str) {
             // let server = server.clone();
             PrimeCheckSession::create(|ctx| {
                 let (r, w) = split(stream);
-                let line_framed = FramedRead::new(r, LinesCodec::new_with_max_length(1024 * 1024));
 
-                PrimeCheckSession::add_stream(line_framed, ctx);
-                PrimeCheckSession::new(actix::io::FramedWrite::new(w, BytesCodec::new(), ctx))
+                PrimeCheckSession::add_stream(FramedRead::new(r, NineBytesDecoder), ctx);
+                PrimeCheckSession::new(actix::io::FramedWrite::new(w, AnswerEncoder, ctx))
             });
         }
     });
@@ -137,7 +145,7 @@ pub fn tcp_server(s: &str) {
 fn main() {
     let system = actix::System::new();
 
-    let _addr = system.block_on(async { tcp_server("0.0.0.0:12345") });
+    system.block_on(async { tcp_server("0.0.0.0:12345") });
 
     system.run().unwrap();
 }
