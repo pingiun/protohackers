@@ -1,269 +1,98 @@
-use std::{borrow::Borrow, net, str::FromStr};
+use std::{collections::HashMap, net, str::FromStr, sync::Arc};
 
 use actix::{prelude::*, spawn};
-use futures::future::join_all;
-use futures::stream::FuturesUnordered;
-use slotmap::{new_key_type, SecondaryMap, SlotMap};
-use tokio::{
-    io::{split, WriteHalf},
-    net::{TcpListener, TcpStream},
-};
-use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use bstr::ByteSlice;
+use tokio::net::UdpSocket;
 
-#[derive(Debug, Eq, PartialEq)]
-enum SessionState {
-    Initial,
-    Joined { key: ClientKey },
-}
-struct ChatSession {
-    framed: actix::io::FramedWrite<String, WriteHalf<TcpStream>, LinesCodec>,
-    server: Addr<ChatServer>,
-    state: SessionState,
-}
-
-impl ChatSession {
-    fn joined(&mut self, key: ClientKey) {
-        self.state = SessionState::Joined { key }
-    }
-}
-
-impl Actor for ChatSession {
-    type Context = Context<Self>;
-
-    fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
-        println!("Connection stopping...");
-        Running::Stop
-    }
-
-    fn stopped(&mut self, _ctx: &mut Self::Context) {
-        println!("Connection stopped...");
-    }
-
-    fn started(&mut self, _ctx: &mut Self::Context) {
-        self.framed
-            .write("Welcome to budgetchat! What shall I call you?".to_string());
-    }
-}
-
-impl StreamHandler<Result<String, LinesCodecError>> for ChatSession {
-    fn finished(&mut self, ctx: &mut Self::Context) {
-        if let SessionState::Joined { key } = &self.state {
-            println!("Sending leave message");
-            self.server
-                .send(LeaveMessage(*key))
-                .into_actor(self)
-                .then(|res, _act, ctx| {
-                    res.unwrap();
-                    ctx.stop();
-                    actix::fut::ready(())
-                })
-                .wait(ctx);
-        }
-        self.framed.close();
-
-    }
-
-    fn handle(&mut self, item: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
-        let line = match item {
-            Ok(line) => line.trim_end().to_string(),
-            Err(LinesCodecError::MaxLineLengthExceeded) => {
-                eprintln!("Line too long");
-                ctx.stop();
-                return;
-            }
-            Err(_) => {
-                eprintln!("IO Error");
-                ctx.stop();
-                return;
-            }
-        };
-        match self.state {
-            SessionState::Initial => {
-                if line.len() < 1 {
-                    eprintln!("Name too short");
-                    ctx.stop();
-                    return;
-                }
-                if !line.chars().all(char::is_alphanumeric) {
-                    eprintln!("Invalid name");
-                    ctx.stop();
-                    return;
-                }
-                self.server
-                    .send(JoinMessage {
-                        addr: ctx.address().recipient::<ChatMessage>(),
-                        name: line.clone(),
-                    })
-                    .into_actor(self)
-                    .then(|res, act, _ctx| {
-                        act.joined(res.unwrap());
-                        actix::fut::ready(())
-                    })
-                    .wait(ctx);
-            }
-            SessionState::Joined { key } => {
-                self.server
-                    .send(SendMessage {
-                        from: key,
-                        msg: line,
-                    })
-                    .into_actor(self)
-                    .then(|_res, _act, _ctx| actix::fut::ready(()))
-                    .wait(ctx);
-            }
-        }
-    }
-}
-
-impl Handler<ChatMessage> for ChatSession {
-    type Result = ();
-
-    fn handle(&mut self, msg: ChatMessage, _sctx: &mut Self::Context) -> Self::Result {
-        self.framed.write(msg.0);
-    }
-}
-
-impl actix::io::WriteHandler<LinesCodecError> for ChatSession {}
-
-impl ChatSession {
-    fn new(
-        framed: actix::io::FramedWrite<String, WriteHalf<TcpStream>, LinesCodec>,
-        server: Addr<ChatServer>,
-    ) -> ChatSession {
-        ChatSession {
-            framed,
-            server,
-            state: SessionState::Initial,
-        }
-    }
-}
-
-new_key_type! {
-    #[derive(Message)]
-    #[rtype(result = "()")]
-    struct ClientKey;
-}
-struct ChatServer {
-    clients: SlotMap<ClientKey, Recipient<ChatMessage>>,
-    names: SecondaryMap<ClientKey, String>,
+#[derive(Debug, Default)]
+struct DataServer {
+    data: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
-struct ChatMessage(String);
-
-#[derive(Debug, Message)]
-#[rtype(result = "ClientKey")]
-struct JoinMessage {
-    addr: Recipient<ChatMessage>,
-    name: String,
+struct SetData {
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
 
 #[derive(Debug, Message)]
-#[rtype(result = "()")]
-struct LeaveMessage(ClientKey);
-
-#[derive(Debug, Message)]
-#[rtype(result = "()")]
-struct SendMessage {
-    from: ClientKey,
-    msg: String,
+#[rtype(result = "Option<Vec<u8>>")]
+struct GetData {
+    key: Vec<u8>,
 }
 
-impl Actor for ChatServer {
+impl Actor for DataServer {
     type Context = Context<Self>;
 }
 
-impl Handler<SendMessage> for ChatServer {
+impl Handler<SetData> for DataServer {
     type Result = ();
 
-    fn handle(&mut self, msg: SendMessage, ctx: &mut Self::Context) -> Self::Result {
-        let name = self.names.get(msg.from).unwrap();
-        let futures = FuturesUnordered::new();
-        for (key, addr) in self.clients.iter() {
-            if key == msg.from {
-                continue;
-            }
-            futures.push(Box::pin(
-                addr.send(ChatMessage(format!("[{}] {}", name, msg.msg))),
-            ));
-        }
-        join_all(futures)
-            .into_actor(self)
-            .then(|_res, _act, _ctx| actix::fut::ready(()))
-            .wait(ctx);
+    fn handle(&mut self, msg: SetData, _ctx: &mut Self::Context) -> Self::Result {
+        self.data.insert(msg.key, msg.value);
     }
 }
 
-impl Handler<JoinMessage> for ChatServer {
-    type Result = MessageResult<JoinMessage>;
+impl Handler<GetData> for DataServer {
+    type Result = Option<Vec<u8>>;
 
-    fn handle(&mut self, msg: JoinMessage, ctx: &mut Self::Context) -> Self::Result {
-        let futures = FuturesUnordered::new();
-        for (_key, addr) in self.clients.iter() {
-            futures.push(Box::pin(
-                addr.send(ChatMessage(format!("* {} has entered the room", msg.name))),
-            ));
-        }
-        futures.push(Box::pin(msg.addr.send(ChatMessage(format!(
-            "* The room contains: {}",
-            self.names.values().map(|x| x.borrow()).collect::<Vec<&str>>().join(", ")
-        )))));
-        let key = self.clients.insert(msg.addr);
-        self.names.insert(key, msg.name);
-        join_all(futures)
-            .into_actor(self)
-            .then(|_res, _act, _ctx| actix::fut::ready(()))
-            .wait(ctx);
-        MessageResult(key)
+    fn handle(&mut self, msg: GetData, _ctx: &mut Self::Context) -> Self::Result {
+        self.data.get(&msg.key).map(|x| x.clone())
     }
 }
 
-impl Handler<LeaveMessage> for ChatServer {
-    type Result = ();
-
-    fn handle(&mut self, msg: LeaveMessage, ctx: &mut Self::Context) -> Self::Result {
-        self.clients.remove(msg.0);
-        let name = self.names.remove(msg.0).unwrap();
-        println!("Leave message received from {}", name);
-        let futures = FuturesUnordered::new();
-        for (_key, addr) in self.clients.iter() {
-            futures.push(Box::pin(
-                addr.send(ChatMessage(format!("* {} has left the room", name))),
-            ));
+async fn handle_message(sock: Arc<UdpSocket>, addr: net::SocketAddr, dataserver: Addr<DataServer>, msg: Vec<u8>) {
+    let split: Vec<&[u8]> = msg.splitn_str(2, b"=").collect();
+    if split.len() == 1 {
+        if msg == b"version" {
+            sock.send_to(b"version=Jelle's key-value dinges 0.1", addr).await.unwrap();
+            return;
         }
-        join_all(futures)
-            .into_actor(self)
-            .then(|_res, _act, _ctx| actix::fut::ready(()))
-            .wait(ctx);
+        // No = found, this is a retrieve request
+        let data = dataserver.send(GetData{key: msg.clone()}).await;
+        match data {
+            Ok(Some(value)) => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&msg);
+                buf.extend_from_slice(b"=");
+                buf.extend_from_slice(&value);
+                sock.send_to(&buf, addr).await.unwrap();
+            },
+            Ok(None) => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&msg);
+                buf.extend_from_slice(b"=");
+                sock.send_to(&buf, addr).await.unwrap();
+            },
+            Err(e) => {
+                eprintln!("Error retrieving data: {}", e);
+            },
+        }
+    } else {
+        // Insertion request
+        dataserver.send(SetData {key: split[0].to_vec(), value: split[1].to_vec()}).await.unwrap();
     }
 }
 
-pub fn tcp_server(s: &str) {
+fn udp_server(s: &str) {
     // Create server listener
     let addr = net::SocketAddr::from_str(s).unwrap();
 
     spawn(async move {
-        let listener = TcpListener::bind(&addr).await.unwrap();
-        let server = ChatServer::create(|_ctx| {
-            return ChatServer {
-                clients: SlotMap::<ClientKey, _>::with_key(),
-                names: SecondaryMap::<ClientKey, _>::new(),
-            };
-        });
-
-        while let Ok((stream, addr)) = listener.accept().await {
-            println!("Connection from: {}", addr);
-            // let server = server.clone();
-            ChatSession::create(|ctx| {
-                let (r, w) = split(stream);
-                let linescodes = LinesCodec::new_with_max_length(2048);
-
-                ChatSession::add_stream(FramedRead::new(r, linescodes), ctx);
-                ChatSession::new(
-                    actix::io::FramedWrite::new(w, LinesCodec::new(), ctx),
-                    server.clone(),
-                )
+        let sock = UdpSocket::bind(&addr).await.unwrap();
+        let server = DataServer::default().start();
+        let s = Arc::new(sock);
+        let mut buf = [0; 1024];
+        loop {
+            let (len, addr) = s.recv_from(&mut buf).await.unwrap();
+            println!("{:?} bytes received from {:?}", len, addr);
+            println!("{:?}", &buf[..len]);
+            let message = Vec::from(&buf[..len]);
+            let sender = Arc::clone(&s);
+            let data = server.clone();
+            spawn(async move {
+                handle_message(sender, addr, data, message).await;
             });
         }
     });
@@ -272,7 +101,7 @@ pub fn tcp_server(s: &str) {
 fn main() {
     let system = actix::System::new();
 
-    system.block_on(async { tcp_server("0.0.0.0:12345") });
+    system.block_on(async { udp_server("0.0.0.0:12345") });
 
     system.run().unwrap();
 }
