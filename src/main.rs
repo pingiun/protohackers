@@ -1,27 +1,33 @@
-use std::ops::Bound::Included;
-use std::{collections::BTreeMap, convert::TryInto, io, net, str::FromStr};
+use std::{borrow::Borrow, net, str::FromStr};
 
 use actix::{prelude::*, spawn};
-use bytes::{BytesMut, BufMut};
+use futures::future::join_all;
+use futures::stream::FuturesUnordered;
+use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use tokio::{
     io::{split, WriteHalf},
     net::{TcpListener, TcpStream},
 };
-use tokio_util::codec::{Decoder, Encoder, FramedRead};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
-enum Request {
-    Insert { time: i32, pennies: i32 },
-    Query { mintime: i32, maxtime: i32 },
+#[derive(Debug, Eq, PartialEq)]
+enum SessionState {
+    Initial,
+    Joined { key: ClientKey },
+}
+struct ChatSession {
+    framed: actix::io::FramedWrite<String, WriteHalf<TcpStream>, LinesCodec>,
+    server: Addr<ChatServer>,
+    state: SessionState,
 }
 
-type Response = i32;
-
-struct PrimeCheckSession {
-    data: BTreeMap<i32, i32>,
-    framed: actix::io::FramedWrite<Response, WriteHalf<TcpStream>, AnswerEncoder>,
+impl ChatSession {
+    fn joined(&mut self, key: ClientKey) {
+        self.state = SessionState::Joined { key }
+    }
 }
 
-impl Actor for PrimeCheckSession {
+impl Actor for ChatSession {
     type Context = Context<Self>;
 
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
@@ -32,93 +38,204 @@ impl Actor for PrimeCheckSession {
     fn stopped(&mut self, _ctx: &mut Self::Context) {
         println!("Connection stopped...");
     }
+
+    fn started(&mut self, _ctx: &mut Self::Context) {
+        self.framed
+            .write("Welcome to budgetchat! What shall I call you?".to_string());
+    }
 }
 
-impl StreamHandler<Result<Request, io::Error>> for PrimeCheckSession {
-    fn finished(&mut self, _ctx: &mut Self::Context) {
+impl StreamHandler<Result<String, LinesCodecError>> for ChatSession {
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        if let SessionState::Joined { key } = &self.state {
+            println!("Sending leave message");
+            self.server
+                .send(LeaveMessage(*key))
+                .into_actor(self)
+                .then(|res, _act, ctx| {
+                    res.unwrap();
+                    ctx.stop();
+                    actix::fut::ready(())
+                })
+                .wait(ctx);
+        }
         self.framed.close();
+
     }
 
-    fn handle(&mut self, item: Result<Request, io::Error>, ctx: &mut Self::Context) {
-        match item {
-            Ok(Request::Insert { time, pennies }) => {
-                println!("Insert at {} value {}", time, pennies);
-                self.data.insert(time, pennies);
+    fn handle(&mut self, item: Result<String, LinesCodecError>, ctx: &mut Self::Context) {
+        let line = match item {
+            Ok(line) => line.trim_end().to_string(),
+            Err(LinesCodecError::MaxLineLengthExceeded) => {
+                eprintln!("Line too long");
+                ctx.stop();
+                return;
             }
-            Ok(Request::Query { mintime, maxtime }) => {
-                println!("Query from {} to {}", mintime, maxtime);
-                if mintime > maxtime {
-                    self.framed.write(0);
+            Err(_) => {
+                eprintln!("IO Error");
+                ctx.stop();
+                return;
+            }
+        };
+        match self.state {
+            SessionState::Initial => {
+                if line.len() < 1 {
+                    eprintln!("Name too short");
+                    ctx.stop();
                     return;
                 }
-                let mut sum: i64 = 0;
-                let mut items = 0;
-                for (_, value) in self.data.range((Included(mintime), Included(maxtime))) {
-                    sum += *value as i64;
-                    items += 1;
+                if !line.chars().all(char::is_alphanumeric) {
+                    eprintln!("Invalid name");
+                    ctx.stop();
+                    return;
                 }
-                self.framed.write(sum.checked_div(items).unwrap_or(0).try_into().unwrap_or(0));
+                self.server
+                    .send(JoinMessage {
+                        addr: ctx.address().recipient::<ChatMessage>(),
+                        name: line.clone(),
+                    })
+                    .into_actor(self)
+                    .then(|res, act, _ctx| {
+                        act.joined(res.unwrap());
+                        actix::fut::ready(())
+                    })
+                    .wait(ctx);
             }
-            Err(e) => {
-                println!("IO Error: {}", e);
-                ctx.stop();
+            SessionState::Joined { key } => {
+                self.server
+                    .send(SendMessage {
+                        from: key,
+                        msg: line,
+                    })
+                    .into_actor(self)
+                    .then(|_res, _act, _ctx| actix::fut::ready(()))
+                    .wait(ctx);
             }
         }
     }
 }
 
-impl actix::io::WriteHandler<io::Error> for PrimeCheckSession {}
+impl Handler<ChatMessage> for ChatSession {
+    type Result = ();
 
-impl PrimeCheckSession {
+    fn handle(&mut self, msg: ChatMessage, _sctx: &mut Self::Context) -> Self::Result {
+        self.framed.write(msg.0);
+    }
+}
+
+impl actix::io::WriteHandler<LinesCodecError> for ChatSession {}
+
+impl ChatSession {
     fn new(
-        framed: actix::io::FramedWrite<Response, WriteHalf<TcpStream>, AnswerEncoder>,
-    ) -> PrimeCheckSession {
-        PrimeCheckSession {
+        framed: actix::io::FramedWrite<String, WriteHalf<TcpStream>, LinesCodec>,
+        server: Addr<ChatServer>,
+    ) -> ChatSession {
+        ChatSession {
             framed,
-            data: BTreeMap::new(),
+            server,
+            state: SessionState::Initial,
         }
     }
 }
 
-struct NineBytesDecoder;
+new_key_type! {
+    #[derive(Message)]
+    #[rtype(result = "()")]
+    struct ClientKey;
+}
+struct ChatServer {
+    clients: SlotMap<ClientKey, Recipient<ChatMessage>>,
+    names: SecondaryMap<ClientKey, String>,
+}
 
-impl Decoder for NineBytesDecoder {
-    type Item = Request;
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+struct ChatMessage(String);
 
-    type Error = io::Error;
+#[derive(Debug, Message)]
+#[rtype(result = "ClientKey")]
+struct JoinMessage {
+    addr: Recipient<ChatMessage>,
+    name: String,
+}
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 9 {
-            return Ok(None);
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+struct LeaveMessage(ClientKey);
+
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+struct SendMessage {
+    from: ClientKey,
+    msg: String,
+}
+
+impl Actor for ChatServer {
+    type Context = Context<Self>;
+}
+
+impl Handler<SendMessage> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: SendMessage, ctx: &mut Self::Context) -> Self::Result {
+        let name = self.names.get(msg.from).unwrap();
+        let futures = FuturesUnordered::new();
+        for (key, addr) in self.clients.iter() {
+            if key == msg.from {
+                continue;
+            }
+            futures.push(Box::pin(
+                addr.send(ChatMessage(format!("[{}] {}", name, msg.msg))),
+            ));
         }
-        let bytes = src.split_to(9);
-
-        let first = i32::from_be_bytes(bytes[1..5].try_into().unwrap());
-        let second = i32::from_be_bytes(bytes[5..9].try_into().unwrap());
-        if bytes[0] == b'I' {
-            Ok(Some(Request::Insert {
-                time: first,
-                pennies: second,
-            }))
-        } else if bytes[0] == b'Q' {
-            Ok(Some(Request::Query {
-                mintime: first,
-                maxtime: second,
-            }))
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, "invalid message type"))
-        }
+        join_all(futures)
+            .into_actor(self)
+            .then(|_res, _act, _ctx| actix::fut::ready(()))
+            .wait(ctx);
     }
 }
 
-struct AnswerEncoder;
+impl Handler<JoinMessage> for ChatServer {
+    type Result = MessageResult<JoinMessage>;
 
-impl Encoder<Response> for AnswerEncoder {
-    type Error = io::Error;
+    fn handle(&mut self, msg: JoinMessage, ctx: &mut Self::Context) -> Self::Result {
+        let futures = FuturesUnordered::new();
+        for (_key, addr) in self.clients.iter() {
+            futures.push(Box::pin(
+                addr.send(ChatMessage(format!("* {} has entered the room", msg.name))),
+            ));
+        }
+        futures.push(Box::pin(msg.addr.send(ChatMessage(format!(
+            "* The room contains: {}",
+            self.names.values().map(|x| x.borrow()).collect::<Vec<&str>>().join(", ")
+        )))));
+        let key = self.clients.insert(msg.addr);
+        self.names.insert(key, msg.name);
+        join_all(futures)
+            .into_actor(self)
+            .then(|_res, _act, _ctx| actix::fut::ready(()))
+            .wait(ctx);
+        MessageResult(key)
+    }
+}
 
-    fn encode(&mut self, item: Response, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.put(&i32::to_be_bytes(item)[..]);
-        Ok(())
+impl Handler<LeaveMessage> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: LeaveMessage, ctx: &mut Self::Context) -> Self::Result {
+        self.clients.remove(msg.0);
+        let name = self.names.remove(msg.0).unwrap();
+        println!("Leave message received from {}", name);
+        let futures = FuturesUnordered::new();
+        for (_key, addr) in self.clients.iter() {
+            futures.push(Box::pin(
+                addr.send(ChatMessage(format!("* {} has left the room", name))),
+            ));
+        }
+        join_all(futures)
+            .into_actor(self)
+            .then(|_res, _act, _ctx| actix::fut::ready(()))
+            .wait(ctx);
     }
 }
 
@@ -128,15 +245,25 @@ pub fn tcp_server(s: &str) {
 
     spawn(async move {
         let listener = TcpListener::bind(&addr).await.unwrap();
+        let server = ChatServer::create(|_ctx| {
+            return ChatServer {
+                clients: SlotMap::<ClientKey, _>::with_key(),
+                names: SecondaryMap::<ClientKey, _>::new(),
+            };
+        });
 
         while let Ok((stream, addr)) = listener.accept().await {
             println!("Connection from: {}", addr);
             // let server = server.clone();
-            PrimeCheckSession::create(|ctx| {
+            ChatSession::create(|ctx| {
                 let (r, w) = split(stream);
+                let linescodes = LinesCodec::new_with_max_length(2048);
 
-                PrimeCheckSession::add_stream(FramedRead::new(r, NineBytesDecoder), ctx);
-                PrimeCheckSession::new(actix::io::FramedWrite::new(w, AnswerEncoder, ctx))
+                ChatSession::add_stream(FramedRead::new(r, linescodes), ctx);
+                ChatSession::new(
+                    actix::io::FramedWrite::new(w, LinesCodec::new(), ctx),
+                    server.clone(),
+                )
             });
         }
     });
